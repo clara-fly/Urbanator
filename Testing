@@ -1,0 +1,23 @@
+import requests
+import pandas as pd
+
+# 1. ArcGIS REST endpoint for Intact Habitat Cores (2023)
+url = "https://arcgis.com"
+
+# 2. Set query parameters (use 'where' to filter, e.g., "STATE = 'CO'")
+params = {
+    "where": "1=1",
+    "outFields": "*",
+    "returnGeometry": "false",
+    "resultRecordCount": 2000,   # Max records per request (increase/paginate if needed)
+    "f": "json"
+}
+
+# 3. Fetch data and convert to DataFrame
+response = requests.get(url, params=params).json()
+records = [feature["attributes"] for feature in response["features"]]
+df = pd.DataFrame(records)
+
+# 4. Save to CSV
+df.to_csv("intact_habitat_cores.csv", index=False)
+print(f"Saved {len(df)} rows to intact_habitat_cores.csv")
