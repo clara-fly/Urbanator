@@ -1,12 +1,11 @@
 import requests
 
-SERVICE = "https://services5.arcgis.com/ttNGmDvKQA7oeDQ3/arcgis/rest/services/CPWSpeciesData/FeatureServer"
-# v
+SERVICE = "https://services5.arcgis.com/ttNGmDvKQA7oeDQ3/arcgis/rest/services/CPWSpeciesData/FeatureServer" #fetch from ArcGIS
 info = requests.get(SERVICE, params={"f": "json"}, timeout=30).json()
 for lyr in info["layers"]:
     print(lyr["id"], lyr["name"])
 
-    import geopandas as gpd
+    import geopandas as gpd 
 import requests
 
 def fetch_layer(service_url, layer_id, where="1=1", page_size=1000):
