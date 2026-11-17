@@ -1,7 +1,7 @@
 import requests
 
 SERVICE = "https://services5.arcgis.com/ttNGmDvKQA7oeDQ3/arcgis/rest/services/CPWSpeciesData/FeatureServer"
-
+# v
 info = requests.get(SERVICE, params={"f": "json"}, timeout=30).json()
 for lyr in info["layers"]:
     print(lyr["id"], lyr["name"])
