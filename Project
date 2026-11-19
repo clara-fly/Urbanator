@@ -1,0 +1,203 @@
+import json, math, sys, shutil                                         # standard library helpers
+from pathlib import Path                                               # file paths for the cache folder
+import numpy as np                                                     # grid math
+import requests                                                        # talks to the ArcGIS servers
+import matplotlib.pyplot as plt                                        # map + popup windows
+from matplotlib.colors import ListedColormap                           # solid green color for protected land
+from matplotlib.patches import Patch                                   # legend box for protected land
+from scipy.signal import fftconvolve                                   # fast "sum of nearby squares" calculation
+from rasterio.features import rasterize                                # turns polygons into grid squares
+from rasterio.io import MemoryFile                                     # reads the NLCD image download
+from rasterio.transform import from_origin                             # links grid rows/cols to lat/lon
+
+# ---------------- SETTINGS ----------------
+WEST, EAST, SOUTH, NORTH = -109.0603, -102.0415, 36.9925, 41.0034      # Colorado treated as a box
+LAT_MID = (SOUTH + NORTH) / 2                                          # middle latitude, used to size squares
+DLAT = 1 / 111.32                                                      # 1 km in degrees of latitude
+DLON = 1 / (111.32 * math.cos(math.radians(LAT_MID)))                  # 1 km in degrees of longitude
+NX, NY = math.ceil((EAST - WEST) / DLON), math.ceil((NORTH - SOUTH) / DLAT)  # number of columns, rows
+TRANSFORM = from_origin(WEST, NORTH, DLON, DLAT)                       # grid -> lat/lon mapping
+SPECIES_URL = "https://services5.arcgis.com/ttNGmDvKQA7oeDQ3/arcgis/rest/services/CPWSpeciesData/FeatureServer"  # CPW species
+PADUS_URL = "https://services.arcgis.com/v01gqwM5QqNysAAi/ArcGIS/rest/services/PADUS3_0FederalFeeManagers_Authoritative/FeatureServer/0"  # protected land
+NLCD_URL = "https://di-nlcd.img.arcgis.com/arcgis/rest/services/USA_NLCD_Annual_LandCover/ImageServer"  # land cover
+PRIORITY = ["Overall Range", "Breeding Range", "HUC 12 Presence"]      # species layer preference, best first
+DEV_CLASSES = (22, 23, 24)                                             # NLCD low/medium/high intensity developed
+DEV_THRESHOLD = 0.25                                                   # square is "developed" if >=25% built
+DECAY_KM, MAX_KM = 5.0, 20                                             # weight = e^(-d/5), ignore beyond 20 km
+SUB = 10                                                               # NLCD samples per km (~100 m spacing)
+PADUS_FIELDS = ["Own_Name", "Own_Type", "Mang_Name", "Unit_Nm", "Des_Tp"]  # protected-land details we keep
+CACHE = Path(__file__).resolve().parent / "urbanization_cache"         # downloads saved here for fast reruns
+GREEN = "#1cb176"                                                      # protected-land color
+
+# ---------------- DOWNLOAD HELPERS ----------------
+def get_json(url, params):                                             # GET a URL and return its JSON
+    r = requests.get(url, params=params, timeout=180)                  # send request
+    r.raise_for_status()                                               # stop on HTTP errors
+    data = r.json()                                                    # parse JSON
+    if "error" in data: raise RuntimeError(data["error"])              # stop on ArcGIS errors
+    return data                                                        # hand back the result
+
+def query_features(layer_url, fields=""):                              # download all polygons in the Colorado box
+    params = {"where": "1=1", "geometry": f"{WEST},{SOUTH},{EAST},{NORTH}",  # everything inside the box
+              "geometryType": "esriGeometryEnvelope", "inSR": 4326, "outSR": 4326,  # box and output in lat/lon
+              "outFields": fields, "maxAllowableOffset": 0.0005,       # attributes wanted; simplify shapes ~50 m
+              "resultRecordCount": 2000, "f": "geojson"}               # 2000 per page, GeoJSON format
+    feats, offset = [], 0                                              # results list, page position
+    while True:                                                        # keep paging until done
+        params["resultOffset"] = offset                                # which page to get
+        data = get_json(f"{layer_url}/query", params)                  # fetch page
+        batch = data.get("features") or []                             # features on this page
+        feats += batch                                                 # add to results
+        more = data.get("exceededTransferLimit") or (data.get("properties") or {}).get("exceededTransferLimit")  # server says more exist?
+        if not batch or (len(batch) < 2000 and not more): return feats  # last page reached
+        offset += len(batch)                                           # move to next page
+
+def burn(feats, values=None):                                          # paint polygons onto the 1 km grid
+    shapes = [(f["geometry"], 1 if values is None else values[i]) for i, f in enumerate(feats) if f.get("geometry")]  # (shape, value) pairs
+    if values is None:                                                 # yes/no mask mode
+        return rasterize(shapes, (NY, NX), transform=TRANSFORM, dtype="uint8").astype(bool) if shapes else np.zeros((NY, NX), bool)  # True where the square's center is inside
+    return rasterize(shapes, (NY, NX), transform=TRANSFORM, fill=-1, dtype="int32") if shapes else np.full((NY, NX), -1, "int32")  # polygon number per square, -1 = none
+
+# ---------------- LOAD DATA (cached) ----------------
+def load_species():                                                    # one yes/no grid per species
+    (CACHE / "species").mkdir(parents=True, exist_ok=True)             # make cache folder
+    plan_file = CACHE / "species_plan.json"                            # saved species->layer choice
+    if plan_file.exists(): plan = json.loads(plan_file.read_text())    # reuse saved choice
+    else:                                                              # otherwise build it
+        options = {}                                                   # species -> {priority: (layer id, suffix)}
+        for lyr in get_json(SPECIES_URL, {"f": "json"})["layers"]:     # every layer in the service
+            name = " ".join(lyr["name"].split())                       # tidy double spaces
+            if "historic" in name.lower(): continue                    # skip historic layers
+            for p, suffix in enumerate(PRIORITY):                      # check each allowed layer type
+                if name.endswith(suffix):                              # layer matches this type
+                    options.setdefault(name[:-len(suffix)].strip(), {})[p] = (lyr["id"], suffix)  # group by species name
+                    break                                              # stop checking types
+        plan = {sp: o[min(o)] for sp, o in sorted(options.items())}    # keep best-priority layer per species
+        plan_file.write_text(json.dumps(plan))                         # save choice
+    names, masks = [], []                                              # species labels and grids
+    for i, (sp, (lid, suffix)) in enumerate(plan.items(), 1):          # each chosen layer
+        f = CACHE / "species" / f"layer_{lid}.npz"                     # cache file for this layer
+        if not f.exists():                                             # not downloaded yet
+            print(f"  [{i}/{len(plan)}] {sp} {suffix}", flush=True)    # progress message
+            try: np.savez_compressed(f, m=burn(query_features(f"{SPECIES_URL}/{lid}")))  # download, grid, save
+            except Exception as e: print(f"    skipped ({e})"); continue  # skip failed layer, retried next run
+        names.append(sp + ("" if suffix == "Overall Range" else f" ({suffix})"))  # label, noting non-overall layers
+        masks.append(np.load(f)["m"])                                  # load grid
+    return names, np.stack(masks)                                      # list + 3D array [species, row, col]
+
+def load_protected():                                                  # protected-land grid + owner details
+    fi, fa = CACHE / "padus_index.npz", CACHE / "padus_attrs.json"     # cache files
+    if fi.exists() and fa.exists(): return np.load(fi)["i"], json.loads(fa.read_text())  # reuse cache
+    print("  downloading PAD-US protected land...", flush=True)        # progress message
+    info = get_json(PADUS_URL, {"f": "json"})                          # layer description
+    codes = {f["name"]: {str(c["code"]): c["name"] for c in f["domain"]["codedValues"]}  # code -> full name (e.g. BLM)
+             for f in info["fields"] if (f.get("domain") or {}).get("codedValues")}  # only fields that use codes
+    feats = query_features(PADUS_URL, ",".join(PADUS_FIELDS))         # download polygons + fields
+    attrs = [{k: codes.get(k, {}).get(str(v), str(v)) if v is not None else "-"  # decode each field
+              for k, v in ((k, (f.get("properties") or {}).get(k)) for k in PADUS_FIELDS)} for f in feats]  # per polygon
+    index = burn(feats, list(range(len(feats))))                       # grid of polygon numbers
+    np.savez_compressed(fi, i=index); fa.write_text(json.dumps(attrs))  # save cache
+    return index, attrs                                                # grid + details
+
+def load_developed():                                                  # fraction of each square already built
+    f = CACHE / "nlcd.npz"                                             # cache file
+    if f.exists(): return np.load(f)["d"]                              # reuse cache
+    t_end = get_json(NLCD_URL, {"f": "json"})["timeInfo"]["timeExtent"][1]  # newest NLCD year available
+    frac, T = np.zeros((NY, NX), np.float32), 100                      # result grid, tile size in squares
+    tiles = [(r, c) for r in range(0, NY, T) for c in range(0, NX, T)]  # split state into tiles
+    for k, (r0, c0) in enumerate(tiles, 1):                            # each tile
+        r1, c1 = min(r0 + T, NY), min(c0 + T, NX)                      # tile end row/col
+        print(f"  NLCD tile {k}/{len(tiles)}", flush=True)             # progress message
+        p = {"bbox": f"{WEST + c0*DLON},{NORTH - r1*DLAT},{WEST + c1*DLON},{NORTH - r0*DLAT}",  # tile box
+             "bboxSR": 4326, "imageSR": 4326, "size": f"{(c1-c0)*SUB},{(r1-r0)*SUB}",  # lat/lon, pixel size
+             "format": "tiff", "pixelType": "U8", "interpolation": "RSP_NearestNeighbor",  # raw class codes
+             "time": t_end, "f": "image"}                              # newest year, return image bytes
+        r = requests.get(f"{NLCD_URL}/exportImage", params=p, timeout=300); r.raise_for_status()  # download tile
+        with MemoryFile(r.content) as mf, mf.open() as ds: a = ds.read(1)  # read image to array
+        h, w = (r1 - r0) * SUB, (c1 - c0) * SUB                        # expected size
+        a = a[np.ix_(np.arange(h) * a.shape[0] // h, np.arange(w) * a.shape[1] // w)]  # force exact size
+        frac[r0:r1, c0:c1] = np.isin(a, DEV_CLASSES).reshape(r1-r0, SUB, c1-c0, SUB).mean((1, 3))  # % developed per square
+    np.savez_compressed(f, d=frac)                                     # save cache
+    return frac                                                        # developed fraction grid
+
+# ---------------- SCORING ----------------
+def compute(stack, dev_frac):                                          # build all score grids
+    count = stack.sum(0)                                               # species per square
+    developed = (dev_frac >= DEV_THRESHOLD).astype(float)              # 1 = developed square
+    y, x = np.mgrid[-MAX_KM:MAX_KM + 1, -MAX_KM:MAX_KM + 1]            # offsets within 20 km
+    d = np.hypot(x, y)                                                 # distance in km
+    kernel = np.where(d <= MAX_KM, np.exp(-d / DECAY_KM), 0)           # e^(-d/5), 0 past 20 km
+    near = np.clip(fftconvolve(developed, kernel, mode="same"), 0, None)  # weighted nearby development
+    ref = np.percentile(near[near > 0], 99) if (near > 0).any() else 1  # 99th percentile as "fully urban"
+    sp_part = 50 * count / max(count.max(), 1)                         # species half: more species = higher
+    px_part = 50 * (1 - np.clip(near / ref, 0, 1))                     # proximity half: less nearby = higher
+    return dict(count=count, sp=sp_part, px=px_part, near=near, score=sp_part + px_part)  # bundle results
+
+# ---------------- POPUP TABLE ----------------
+def show_info(D, lat, lon, block=True):                                # popup for one square
+    if not (WEST <= lon <= EAST and SOUTH <= lat <= NORTH): return print("  Outside Colorado box.")  # bounds check
+    r, c = min(int((NORTH - lat) / DLAT), NY - 1), min(int((lon - WEST) / DLON), NX - 1)  # find the square
+    idx = D["pidx"][r, c]                                              # protected polygon number (-1 = none)
+    species = [D["names"][k] for k in np.flatnonzero(D["stack"][:, r, c])]  # species in this square
+    score = D["score"][r, c]                                           # urbanization score
+    rows = [["Coordinates", f"{lat:.5f}, {lon:.5f}"], ["Grid square (row, col)", f"{r}, {c}"]]  # basic info
+    if idx >= 0:                                                       # protected land
+        a = D["pattrs"][idx]                                           # its details
+        rows += [["Status", "PROTECTED - building NOT allowed"], ["Owner", a["Own_Name"]],  # status + owner
+                 ["Owner type", a["Own_Type"]], ["Manager", a["Mang_Name"]], ["Area name", a["Unit_Nm"]],  # more details
+                 ["Designation", a["Des_Tp"]], ["Urbanization score", f"NOT ALLOWED (raw {score:.1f})"]]  # score blocked
+    else: rows += [["Status", "Not protected"], ["Urbanization score", f"{score:.1f} / 100"]]  # buildable
+    rows += [["  Species half (0-50)", f"{D['sp'][r, c]:.1f}  ({len(species)} species)"],  # species part
+             ["  Proximity half (0-50)", f"{D['px'][r, c]:.1f}  (weighted nearby dev. {D['near'][r, c]:.2f})"],  # proximity part
+             ["Square already developed", f"{D['dev'][r, c] * 100:.0f}%"]]  # how built-up it is now
+    sp = species or ["None recorded"]                                  # species list (or placeholder)
+    n = math.ceil(len(sp) / 3)                                         # rows needed for 3 columns
+    grid = [[sp[j * n + i] if j * n + i < len(sp) else "" for j in range(3)] for i in range(n)]  # 3-column layout
+    fig, (a1, a2) = plt.subplots(2, 1, figsize=(11, 3 + 0.3 * (len(rows) + n)),  # two stacked tables
+                                 gridspec_kw={"height_ratios": [len(rows) + 1, n + 1]})  # sized to content
+    for ax in (a1, a2): ax.axis("off")                                 # hide axes
+    t1 = a1.table(cellText=rows, colLabels=["Item", "Value"], colWidths=[0.3, 0.7], cellLoc="left", loc="upper center")  # info table
+    t2 = a2.table(cellText=grid, cellLoc="left", loc="upper center")   # species table
+    for t in (t1, t2): t.auto_set_font_size(False); t.set_fontsize(9); t.scale(1, 1.3)  # readable text
+    a1.set_title("Urbanization assessment", loc="left", fontweight="bold")  # top title
+    a2.set_title(f"Species in this square ({len(species)})", loc="left", fontweight="bold")  # bottom title
+    fig.tight_layout()                                                 # tidy spacing
+    plt.show() if block else fig.show()                                # wait, or open alongside the map
+
+# ---------------- MAP ----------------
+def show_map(D):                                                       # statewide map
+    fig, ax = plt.subplots(figsize=(13, 8.5))                          # window size
+    ext = [WEST, WEST + NX * DLON, NORTH - NY * DLAT, NORTH]           # map corners in lon/lat
+    im = ax.imshow(D["score"], cmap="Greys", vmin=0, vmax=100, extent=ext, interpolation="nearest")  # 0 white -> 100 black
+    ax.imshow(np.ma.masked_where(D["pidx"] < 0, np.ones((NY, NX))), cmap=ListedColormap([GREEN]),  # protected squares...
+              extent=ext, interpolation="nearest")                     # ...drawn solid green on top
+    ax.set_xlim(WEST, EAST); ax.set_ylim(SOUTH, NORTH)                 # trim to the box
+    ax.set_aspect(1 / math.cos(math.radians(LAT_MID)))                 # keep squares looking square
+    ax.set_title("Colorado urbanization score (click a square for details)")  # title
+    ax.set_xlabel("Longitude"); ax.set_ylabel("Latitude")              # axis labels
+    fig.colorbar(im, ax=ax, fraction=0.03).set_label("Score: 0 = white (low danger), 100 = black (high danger)")  # scale legend
+    ax.legend(handles=[Patch(color=GREEN, label="Protected land - no building")], loc="upper center", bbox_to_anchor=(0.5, -0.07))  # green legend
+    def click(e):                                                      # runs when you click the map
+        tb = getattr(fig.canvas, "toolbar", None)                      # zoom/pan toolbar
+        if e.inaxes is ax and e.button == 1 and not (tb and tb.mode): show_info(D, e.ydata, e.xdata, block=False)  # left-click = popup
+    fig.canvas.mpl_connect("button_press_event", click)                # hook up clicks
+    plt.show()                                                         # display until closed
+
+# ---------------- MAIN ----------------
+def main():                                                            # program start
+    if "--refresh" in sys.argv: shutil.rmtree(CACHE, ignore_errors=True)  # optional: wipe cache, re-download
+    print("Loading species..."); names, stack = load_species()         # CPW data
+    print("Loading protected land..."); pidx, pattrs = load_protected()  # PAD-US data
+    print("Loading developed land..."); dev = load_developed()         # NLCD data
+    D = dict(names=names, stack=stack, pidx=pidx, pattrs=pattrs, dev=dev, **compute(stack, dev))  # everything in one dict
+    print(f"Ready: {NX} x {NY} squares, {len(names)} species.")       # done loading
+    while True:                                                        # menu loop
+        ch = input("\n1 = look up coordinates, 2 = show map, q = quit: ").strip().lower()  # ask user
+        if ch == "1":                                                  # coordinate lookup
+            try: lat, lon = map(float, input("lat, lon (e.g. 39.7555, -105.2211): ").replace(",", " ").split())  # read numbers
+            except ValueError: print("  Enter two numbers."); continue  # bad input
+            show_info(D, lat, lon)                                     # popup table
+        elif ch == "2": show_map(D)                                    # map
+        elif ch == "q": break                                          # exit
+
+if __name__ == "__main__": main()                                      # run when started directly
